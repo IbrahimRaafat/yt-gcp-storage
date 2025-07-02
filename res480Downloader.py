@@ -28,6 +28,7 @@ def download480(url):
         subprocess.run([
             "yt-dlp",
             "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]",
+            "--cookies", "cookies.txt",
             "-o", base_filename + ".%(ext)s",
             url,
         ], check=True)

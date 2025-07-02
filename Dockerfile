@@ -20,6 +20,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # Copy project files
 COPY . /app/
+COPY cookies.txt /app/
 
 # Expose port
 EXPOSE 8080
