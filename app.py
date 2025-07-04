@@ -22,6 +22,36 @@ chunked_stop_event = threading.Event()
 # Set your bucket name here or use an environment variable
 BUCKET_NAME = "hidden-matter-450501-n0_cloudbuild"
 
+@app.route('/diagnose', methods=['GET'])
+def diagnose():
+    """Diagnostic endpoint to check system status"""
+    try:
+        # Check yt-dlp version
+        yt_dlp_result = subprocess.run(
+            ["yt-dlp", "--version"],
+            capture_output=True, text=True
+        )
+        yt_dlp_version = yt_dlp_result.stdout.strip() if yt_dlp_result.returncode == 0 else "Not available"
+        
+        # Check if cookies file exists
+        cookies_exist = os.path.exists("cookies.txt")
+        
+        # Check ffmpeg
+        ffmpeg_result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True
+        )
+        ffmpeg_available = ffmpeg_result.returncode == 0
+        
+        return jsonify({
+            'yt_dlp_version': yt_dlp_version,
+            'cookies_file_exists': cookies_exist,
+            'ffmpeg_available': ffmpeg_available,
+            'system_status': 'OK' if yt_dlp_version != "Not available" and ffmpeg_available else 'Issues detected'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/download', methods=['POST'])
 def download_and_upload():
     data = request.get_json()
@@ -52,12 +82,56 @@ def download_and_upload():
         return jsonify({'error': str(e)}), 500
 
 def get_direct_stream_url(youtube_url):
-    result = subprocess.run(
-        ["yt-dlp", "-g", youtube_url],
-        capture_output=True, text=True, check=True
-    )
-    urls = result.stdout.strip().split('\n')
-    return urls[0]  # Use the first URL
+    try:
+        # First try with cookies
+        print(f"Attempting to get direct URL for: {youtube_url}")
+        result = subprocess.run(
+            ["yt-dlp", "--cookies", "cookies.txt", "-g", youtube_url],
+            capture_output=True, text=True, check=True
+        )
+        urls = result.stdout.strip().split('\n')
+        if urls and urls[0]:
+            print(f"Successfully got direct URL: {urls[0][:100]}...")
+            return urls[0]  # Use the first URL
+        else:
+            raise Exception("No URLs returned from yt-dlp")
+    except subprocess.CalledProcessError as e:
+        print(f"yt-dlp error with cookies: {e.stderr}")
+        print(f"yt-dlp stdout: {e.stdout}")
+        
+        # Try without cookies as fallback
+        try:
+            print("Retrying without cookies...")
+            result = subprocess.run(
+                ["yt-dlp", "-g", youtube_url],
+                capture_output=True, text=True, check=True
+            )
+            urls = result.stdout.strip().split('\n')
+            if urls and urls[0]:
+                print(f"Successfully got direct URL without cookies: {urls[0][:100]}...")
+                return urls[0]
+            else:
+                raise Exception("No URLs returned from yt-dlp")
+        except subprocess.CalledProcessError as e2:
+            print(f"yt-dlp error without cookies: {e2.stderr}")
+            print(f"yt-dlp stdout: {e2.stdout}")
+            
+            # Try updating yt-dlp as last resort
+            print("Attempting to update yt-dlp...")
+            try:
+                subprocess.run(["pip", "install", "--upgrade", "yt-dlp"], check=True)
+                print("yt-dlp updated, retrying...")
+                result = subprocess.run(
+                    ["yt-dlp", "-g", youtube_url],
+                    capture_output=True, text=True, check=True
+                )
+                urls = result.stdout.strip().split('\n')
+                if urls and urls[0]:
+                    return urls[0]
+            except Exception as update_error:
+                print(f"Failed to update yt-dlp: {update_error}")
+            
+            raise Exception(f"Failed to get direct stream URL. Last error: {e2.stderr}")
 
 # Helper: Start ffmpeg chunked download with 30s chunks and title dir
 def chunked_download(url, chunk_time=30):
