@@ -19,6 +19,14 @@ chunked_uploader_thread = None
 uploaded_chunks = set()
 chunked_stop_event = threading.Event()
 
+# Status tracking
+download_status = {
+    'active_downloads': {},
+    'total_downloads': 0,
+    'total_chunks_uploaded': 0,
+    'system_status': 'idle'
+}
+
 # Set your bucket name here or use an environment variable
 BUCKET_NAME = "hidden-matter-450501-n0_cloudbuild"
 
@@ -49,6 +57,61 @@ def diagnose():
             'ffmpeg_available': ffmpeg_available,
             'system_status': 'OK' if yt_dlp_version != "Not available" and ffmpeg_available else 'Issues detected'
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get current download and upload status"""
+    global download_status, chunked_download_proc, chunked_uploader_thread
+    
+    try:
+        # Update active downloads status
+        active_downloads = {}
+        for dir_name in os.listdir('.'):
+            if os.path.isdir(dir_name) and not dir_name.startswith('.'):
+                chunk_files = [f for f in os.listdir(dir_name) if f.startswith('chunk_') and f.endswith('.mp4')]
+                uploaded_count = len([f for f in chunk_files if f in uploaded_chunks])
+                total_chunks = len(chunk_files)
+                
+                # Check if download process is still running
+                is_downloading = False
+                if chunked_download_proc:
+                    is_downloading = chunked_download_proc.poll() is None
+                
+                active_downloads[dir_name] = {
+                    'total_chunks': total_chunks,
+                    'uploaded_chunks': uploaded_count,
+                    'remaining_chunks': total_chunks - uploaded_count,
+                    'is_downloading': is_downloading,
+                    'is_uploading': chunked_uploader_thread and chunked_uploader_thread.is_alive(),
+                    'progress_percentage': round((uploaded_count / max(total_chunks, 1)) * 100, 2)
+                }
+        
+        # Calculate totals
+        total_active = len(active_downloads)
+        total_chunks_uploaded = sum(d['uploaded_chunks'] for d in active_downloads.values())
+        
+        # Determine system status
+        if total_active > 0:
+            if any(d['is_downloading'] for d in active_downloads.values()):
+                system_status = 'downloading'
+            elif any(d['is_uploading'] for d in active_downloads.values()):
+                system_status = 'uploading'
+            else:
+                system_status = 'processing'
+        else:
+            system_status = 'idle'
+        
+        return jsonify({
+            'system_status': system_status,
+            'active_downloads': total_active,
+            'downloads': active_downloads,
+            'total_chunks_uploaded': total_chunks_uploaded,
+            'total_downloads_completed': download_status['total_downloads'],
+            'timestamp': time.time()
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -152,37 +215,69 @@ def chunked_download(url, chunk_time=30):
 
 # Helper: Background uploader for title dir
 def uploader_thread_func(uploaded_chunks, stop_event, dir_name):
+    global download_status
+    print(f"Uploader thread started for directory: {dir_name}")
+    
     while not stop_event.is_set() or any(f.startswith("chunk_") for f in os.listdir(dir_name)):
         for filename in os.listdir(dir_name):
             if filename.startswith("chunk_") and filename.endswith(".mp4") and filename not in uploaded_chunks:
                 full_path = os.path.join(dir_name, filename)
                 try:
+                    print(f"Uploading chunk: {filename}")
                     upload_blob(BUCKET_NAME, full_path, f"{dir_name}/{filename}")
                     os.remove(full_path)
                     uploaded_chunks.add(filename)
+                    download_status['total_chunks_uploaded'] += 1
+                    print(f"Successfully uploaded and removed: {filename}")
                 except Exception as e:
                     print(f"Error uploading chunk {filename}: {e}")
         time.sleep(2)
+    
+    print(f"Uploader thread finished for directory: {dir_name}")
 
 @app.route('/start_chunked_download', methods=['POST'])
 def start_chunked_download():
-    global chunked_download_proc, chunked_uploader_thread, uploaded_chunks, chunked_stop_event
+    global chunked_download_proc, chunked_uploader_thread, uploaded_chunks, chunked_stop_event, download_status
     data = request.get_json()
     url = data.get('url')
     if not url:
         return jsonify({'error': 'Missing url'}), 400
+    
     uploaded_chunks = set()
     chunked_stop_event.clear()
+    
     # Get title and safe dir name
     title = getTitle(url)
     safe_title = "".join(c for c in title if c not in '/\\:*?"<>|').strip() or "video"
     dir_name = safe_title
+    
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
+    
+    # Update status
+    download_status['system_status'] = 'downloading'
+    download_status['active_downloads'][dir_name] = {
+        'url': url,
+        'title': title,
+        'start_time': time.time(),
+        'total_chunks': 0,
+        'uploaded_chunks': 0,
+        'remaining_chunks': 0,
+        'is_downloading': True,
+        'is_uploading': False,
+        'progress_percentage': 0.0
+    }
+    
     chunked_download_proc = chunked_download(url, chunk_time=30)
     chunked_uploader_thread = threading.Thread(target=uploader_thread_func, args=(uploaded_chunks, chunked_stop_event, dir_name))
     chunked_uploader_thread.start()
-    return jsonify({'status': 'started', 'directory': dir_name})
+    
+    return jsonify({
+        'status': 'started', 
+        'directory': dir_name,
+        'title': title,
+        'message': f'Started downloading {title}'
+    })
 
 @app.route('/stop_chunked_download', methods=['POST'])
 def stop_chunked_download():
